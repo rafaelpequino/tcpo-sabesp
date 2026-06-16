@@ -378,55 +378,126 @@ def listar_links_categorias(frame_menu):
 
 # ── Extração de tabela ────────────────────────────────────────────────────────
 
-def _localizar_tabela(frame):
-    """Encontra a tabela de composições pelo cabeçalho."""
-    for t in frame.locator("table").all():
-        try:
-            header = t.locator("tr:first-child").inner_text().lower()
-            if any(p in header for p in ["descrição", "item", "base", "unidade"]):
-                return t
-        except Exception:
+def _frame_conteudo(page, frame_menu):
+    """
+    Retorna o frame que contém os resultados (o que NÃO é o menu e NÃO é o
+    frame principal). Após um clique numa categoria, é neste frame que a
+    tabela de resultados é carregada.
+    """
+    menu_url = getattr(frame_menu, "url", "") or ""
+    for f in page.frames:
+        if f is page.main_frame:
             continue
-    return None
+        url = f.url or ""
+        if url == menu_url or not url or url == "about:blank":
+            continue
+        return f
+    return page
 
 
 def extrair_dados_categoria(frame_conteudo):
-    """Extrai todas as linhas da categoria atual, incluindo paginação."""
+    """
+    Extrai TODOS os itens da tabela de resultados, incluindo paginação.
+    Usa JavaScript para localizar a tabela correta (ignora o painel de
+    filtros que tem texto de checkboxes) e coleta todas as linhas de dados.
+    """
     todos  = []
     pagina = 1
 
     while True:
         try:
-            frame_conteudo.wait_for_load_state("networkidle", timeout=8_000)
+            frame_conteudo.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
-        time.sleep(0.4)
+        time.sleep(0.5)
 
-        tabela = _localizar_tabela(frame_conteudo)
-        if not tabela:
+        linhas = frame_conteudo.evaluate("""
+            () => {
+                // Texto que identifica o painel de filtros — deve ser IGNORADO
+                const FILTRO = /Procurar somente|FRASE EXATA|Listar somente COMP|Listar somente INSU/i;
+
+                // Encontrar a tabela de resultados:
+                // Critério principal: cabeçalho com Base + Item + Descrição ou Unidade
+                // Critério secundário: tabela com mais linhas que não seja filtro
+                let melhorTabela = null;
+                let melhorLinhas = 0;
+
+                for (const t of document.querySelectorAll('table')) {
+                    // Pular tabelas que são o painel de filtros
+                    const txt = (t.innerText || '');
+                    if (FILTRO.test(txt) && !/TCPO|3R |Código/i.test(txt)) continue;
+
+                    const rows = t.querySelectorAll('tr');
+                    if (rows.length < 2) continue;
+
+                    const header = (rows[0].innerText || '').toLowerCase();
+                    const isResultTable = (
+                        (header.includes('item') || header.includes('base')) &&
+                        (header.includes('descri') || header.includes('unidade'))
+                    );
+
+                    if (isResultTable) {
+                        melhorTabela = t;
+                        break;  // encontrou pelo cabeçalho — parar aqui
+                    }
+
+                    // Fallback: tabela com mais linhas sem ser filtro
+                    if (rows.length > melhorLinhas) {
+                        melhorLinhas = rows.length;
+                        melhorTabela = t;
+                    }
+                }
+
+                if (!melhorTabela) return [];
+
+                const result = [];
+                const rows = melhorTabela.querySelectorAll('tr');
+                // Pular linha de cabeçalho (row 0) e coletar todas as linhas de dados
+                for (let i = 1; i < rows.length; i++) {
+                    const cells = rows[i].querySelectorAll('td');
+                    if (cells.length < 2) continue;
+                    const vals = Array.from(cells).map(c => (c.innerText || '').trim());
+                    // Pular linhas de paginação (contêm só números ou símbolos)
+                    if (vals.every(v => v === '' || /^[\\d\\s<>»«\\.]+$/.test(v))) continue;
+                    if (vals.some(v => v !== '')) result.push(vals);
+                }
+                return result;
+            }
+        """)
+
+        n = len(linhas) if linhas else 0
+        if n > 0:
+            todos.extend(linhas)
+            print(f"      Pág {pagina}: {n} itens")
+        else:
+            if pagina == 1:
+                print(f"      Pág {pagina}: 0 itens (sem tabela de resultados)")
             break
 
-        linhas = tabela.locator("tr").all()
-        n = 0
-        for linha in linhas:
-            cols = linha.locator("td").all()
-            if len(cols) >= 2:
-                vals = [c.inner_text().strip() for c in cols]
-                if any(vals):
-                    todos.append(vals)
-                    n += 1
+        # ── Paginação ──────────────────────────────────────────────────────
+        # O GridView ASP.NET renderiza os links de página dentro da tabela.
+        # Tentamos via JS para pegar qualquer padrão de paginação.
+        proxima = frame_conteudo.evaluate("""
+            () => {
+                // Links de próxima página: '>' ou '>>' ou 'Próxima' ou número de página
+                const candidatos = Array.from(document.querySelectorAll('a'));
+                for (const a of candidatos) {
+                    const t = (a.innerText || '').trim();
+                    const title = (a.title || '').toLowerCase();
+                    if (t === '>' || t === '>>' || t === '»' ||
+                        /próxima|próx|next/i.test(t) ||
+                        /próxima|next/i.test(title)) {
+                        a.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
 
-        print(f"      Pág {pagina}: {n} itens")
-
-        # Verificar se há próxima página
-        prox = frame_conteudo.locator(
-            "a:text-is('Próxima'), a:text-is('>>'), a:text-is('>'), "
-            "a[title*='Próxima'], a[title*='próxima'], input[value*='róxima']"
-        )
-        if prox.count() > 0 and prox.first.is_visible():
-            prox.first.click()
+        if proxima:
             pagina += 1
-            time.sleep(0.6)
+            time.sleep(1.0)
         else:
             break
 
@@ -567,6 +638,37 @@ def configurar_filtros_busca(page):
     time.sleep(0.5)
 
 
+# ── Logout ────────────────────────────────────────────────────────────────────
+
+def fazer_logout(page):
+    """
+    Clica em 'Sair' no canto superior direito para encerrar a sessão.
+    Sempre chamado no bloco finally — executa mesmo em caso de erro ou Ctrl+C.
+    """
+    print("\n  Fazendo logout...")
+    try:
+        alvos = [page] + list(page.frames)
+        for alvo in alvos:
+            for sel in [
+                "#lnkSair", "#linkSair", "a[id*='Sair']", "a[id*='sair']",
+                "a[href*='Sair']", "a[href*='sair']",
+                "a[href*='logout']", "a[href*='Logout']",
+                "a:has-text('Sair')",
+            ]:
+                try:
+                    loc = alvo.locator(sel)
+                    if loc.count() > 0 and loc.first.is_visible(timeout=2_000):
+                        loc.first.click()
+                        page.wait_for_load_state("domcontentloaded", timeout=8_000)
+                        print("  \u2713 Logout realizado.")
+                        return
+                except Exception:
+                    continue
+        print("  [!] Link 'Sair' n\u00e3o encontrado — feche a sess\u00e3o manualmente se necess\u00e1rio.")
+    except Exception as e:
+        print(f"  [!] Erro ao fazer logout: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -587,114 +689,113 @@ def main():
         fazer_login(page, usuario, senha)
         print("    Login OK.")
 
-        # 2. Identificar estrutura
-        print("\n[2] Identificando layout da página...")
-        time.sleep(2)
-        frame_menu, _ = identificar_frames(page)
-        frame_url = getattr(frame_menu, "url", "") or ""
-        print(f"    Frame menu: {frame_url or 'página principal'}")
-        container = _tree_container(frame_menu)
-        print(f"    Container da árvore: {'encontrado' if container else 'NÃO ENCONTRADO — inspecione o id do div da árvore'}")
+        try:
+            # 2. Identificar estrutura
+            print("\n[2] Identificando layout da página...")
+            time.sleep(2)
+            frame_menu, _ = identificar_frames(page)
+            frame_url = getattr(frame_menu, "url", "") or ""
+            print(f"    Frame menu: {frame_url or 'página principal'}")
+            container = _tree_container(frame_menu)
+            print(f"    Container da árvore: {'encontrado' if container else 'NÃO ENCONTRADO — inspecione o id do div da árvore'}")
 
-        # 3. Selecionar banco TCPO PINI e configurar filtros
-        print(f"\n[3] Selecionando banco '{BANCO_ALVO}'...")
-        selecionar_banco_tcpo_pini(frame_menu)
-        page.wait_for_load_state("networkidle", timeout=TIMEOUT)
-        time.sleep(1.5)
+            # 3. Selecionar banco TCPO PINI e configurar filtros
+            print(f"\n[3] Selecionando banco '{BANCO_ALVO}'...")
+            selecionar_banco_tcpo_pini(frame_menu)
+            page.wait_for_load_state("networkidle", timeout=TIMEOUT)
+            time.sleep(1.5)
 
-        print("\n[4] Configurando filtros de busca avançada...")
-        configurar_filtros_busca(page)
+            print("\n[4] Configurando filtros de busca avançada...")
+            configurar_filtros_busca(page)
 
-        frame_menu, _ = identificar_frames(page)
-        banco = {"texto": BANCO_ALVO}
+            frame_menu, _ = identificar_frames(page)
+            banco = {"texto": BANCO_ALVO}
 
-        print(f"\n  ╔══ Banco: {banco['texto']} ══╗")
+            print(f"\n  ╔══ Banco: {banco['texto']} ══╗")
 
-        # Expandir árvore
-        expandir_arvore(frame_menu)
+            # Expandir árvore
+            expandir_arvore(frame_menu)
 
-        # Listar categorias
-        links = listar_links_categorias(frame_menu)
-        print(f"  {len(links)} categorias encontradas.")
+            # Listar categorias
+            links = listar_links_categorias(frame_menu)
+            print(f"  {len(links)} categorias encontradas.")
 
-        # Processar cada categoria
-        processados = set()
-        for i, lnk in enumerate(links, 1):
-            texto = lnk["texto"]
-            chave = (banco["texto"], texto, lnk["href"], lnk["onclick"])
-            if chave in processados:
-                continue
-            processados.add(chave)
+            # Processar cada categoria
+            processados = set()
+            for i, lnk in enumerate(links, 1):
+                texto = lnk["texto"]
+                chave = (banco["texto"], texto, lnk["href"], lnk["onclick"])
+                if chave in processados:
+                    continue
+                processados.add(chave)
 
-            print(f"\n  [{i}/{len(links)}] {texto}")
+                print(f"\n  [{i}/{len(links)}] {texto}")
 
-            try:
-                fm, fc = identificar_frames(page)
+                try:
+                    fm, fc = identificar_frames(page)
 
-                # Clicar via JavaScript usando o href/onclick exato capturado
-                # pelo listar_links_categorias. Isso evita depender de
-                # visibilidade do elemento (que falha em nós ainda colapsados)
-                # e evita confundir com elementos do cabeçalho.
-                href    = lnk["href"]
-                onclick = lnk["onclick"]
+                    href    = lnk["href"]
+                    onclick = lnk["onclick"]
 
-                clicou = fm.evaluate("""
-                    ([href, onclick, texto]) => {
-                        // Procura dentro do container da árvore pelo href OU onclick exatos
-                        const container = (
-                            document.querySelector("[id*='TreeView']") ||
-                            document.querySelector("[id*='TreeMenu']") ||
-                            document.querySelector("[id*='menuLateral']")
-                        );
-                        if (!container) return false;
-                        for (const a of container.querySelectorAll('a')) {
-                            const aHref    = a.getAttribute('href')    || '';
-                            const aOnclick = a.getAttribute('onclick') || '';
-                            const aTexto   = (a.innerText || '').trim();
-                            if (aTexto === texto &&
-                                (aHref === href || aOnclick === onclick)) {
-                                a.click();
-                                return true;
+                    clicou = fm.evaluate("""
+                        ([href, onclick, texto]) => {
+                            const container = (
+                                document.querySelector("[id*='TreeView']") ||
+                                document.querySelector("[id*='TreeMenu']") ||
+                                document.querySelector("[id*='menuLateral']")
+                            );
+                            if (!container) return false;
+                            for (const a of container.querySelectorAll('a')) {
+                                const aHref    = a.getAttribute('href')    || '';
+                                const aOnclick = a.getAttribute('onclick') || '';
+                                const aTexto   = (a.innerText || '').trim();
+                                if (aTexto === texto &&
+                                    (aHref === href || aOnclick === onclick)) {
+                                    a.click();
+                                    return true;
+                                }
                             }
+                            return false;
                         }
-                        return false;
-                    }
-                """, [href, onclick, texto])
+                    """, [href, onclick, texto])
 
-                if not clicou:
-                    print("      → Link não encontrado no DOM, pulando.")
-                    continue
+                    if not clicou:
+                        print("      → Link não encontrado no DOM, pulando.")
+                        continue
 
-                time.sleep(SLOW_MO / 1000 + 0.8)
+                    time.sleep(SLOW_MO / 1000 + 0.8)
 
-                _, fc = identificar_frames(page)
-                dados = extrair_dados_categoria(fc)
+                    fc = _frame_conteudo(page, fm)
+                    dados = extrair_dados_categoria(fc)
 
-                if not dados:
-                    print("      → Sem tabela (nó de expansão ou categoria vazia).")
-                    continue
+                    if not dados:
+                        print("      → Sem tabela (nó de expansão ou categoria vazia).")
+                        continue
 
-                for linha in dados:
-                    while len(linha) < 4:
-                        linha.append("")
-                    todos_registros.append({
-                        "Banco":      banco["texto"],
-                        "Categoria":  texto,
-                        "Base":       linha[0],
-                        "Item":       linha[1],
-                        "Descrição":  linha[2],
-                        "Unidade":    linha[3] if len(linha) > 3 else "",
-                    })
+                    for linha in dados:
+                        while len(linha) < 4:
+                            linha.append("")
+                        todos_registros.append({
+                            "Banco":      banco["texto"],
+                            "Categoria":  texto,
+                            "Base":       linha[0],
+                            "Item":       linha[1],
+                            "Descrição":  linha[2],
+                            "Unidade":    linha[3] if len(linha) > 3 else "",
+                        })
 
-                print(f"      ✓ {len(dados)} itens adicionados "
-                      f"(total acumulado: {len(todos_registros)})")
+                    print(f"      ✓ {len(dados)} itens adicionados "
+                          f"(total acumulado: {len(todos_registros)})")
 
-            except PWTimeout:
-                print("      ✗ Timeout, continuando...")
-            except Exception as e:
-                print(f"      ✗ Erro: {type(e).__name__}: {e}")
+                except PWTimeout:
+                    print("      ✗ Timeout, continuando...")
+                except Exception as e:
+                    print(f"      ✗ Erro: {type(e).__name__}: {e}")
 
-        browser.close()
+        finally:
+            # Logout SEMPRE executado — mesmo em erro ou Ctrl+C
+            fazer_logout(page)
+            browser.close()
 
     # 5. Salvar Excel
     print("\n" + "=" * 58)
