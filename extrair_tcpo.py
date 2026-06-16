@@ -122,8 +122,39 @@ def fazer_login(page, usuario, senha):
     page.wait_for_load_state("networkidle", timeout=TIMEOUT)
     time.sleep(2)
 
+    # Verificar se apareceu o aviso de "Acesso negado / usuário já logado"
+    _verificar_acesso_negado(page)
+
     # Página intermediária: clicar em "Composições e preços"
     _navegar_composicoes(page)
+
+
+def _verificar_acesso_negado(page):
+    """
+    Detecta o modal 'Acesso negado. Este usuário já está utilizando esta
+    aplicação em outro navegador...' e encerra o script com mensagem clara.
+    """
+    alvos = [page] + list(page.frames)
+    for alvo in alvos:
+        try:
+            aviso = alvo.locator("text=Acesso negado")
+            if aviso.count() > 0 and aviso.first.is_visible(timeout=2_000):
+                # Tenta clicar em OK para fechar o modal antes de sair
+                try:
+                    alvo.locator("input[value='OK'], button:has-text('OK'), a:has-text('OK')").first.click()
+                except Exception:
+                    pass
+                print("\n" + "=" * 58)
+                print("  ACESSO NEGADO")
+                print("  Este usuário já está logado em outro navegador")
+                print("  ou computador. Feche a outra sessão e tente")
+                print("  novamente.")
+                print("=" * 58 + "\n")
+                raise SystemExit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            continue
 
 
 def _navegar_composicoes(page):
@@ -171,99 +202,178 @@ def _navegar_composicoes(page):
 
 # ── Identificar frames ────────────────────────────────────────────────────────
 
-_MENU_KEYWORDS    = ["TreeView", "Canteiro", "Serviços Iniciais", "treeMenu",
-                     "menuLateral", "arvore", "navegacao"]
-_CONTENT_KEYWORDS = ["Mostrando:", "ctl00_Content", "gridDados",
-                     "gridResultado", "tblComposicoes"]
+# Fragmentos de URL que identificam cada frame pelo endereço (mais confiável
+# que varrer o HTML completo, que pode retornar a página inteira por engano).
+_URL_MENU    = ["TreeView", "treeview", "MenuLateral", "menuLateral"]
+_URL_CONTENT = ["Pesq", "pesq", "Resultado", "resultado", "Composicao",
+                "composicao", "Grid", "grid"]
+
+# Palavras-chave no HTML como fallback (só usadas se a URL não resolver)
+_HTML_MENU    = ["ctl00_TreeView", "TreeView1", "Canteiro de obras",
+                 "Serviços Iniciais", "treeMenu"]
+_HTML_CONTENT = ["Mostrando:", "ctl00_MainContent_grid", "gridDados",
+                 "gridResultado", "tblComposicoes"]
 
 
 def identificar_frames(page):
     """
     Retorna (frame_menu, frame_conteudo).
-    Se a página não usar framesets/iframes, devolve (page, page).
+    Prioriza detecção por URL do frame; usa HTML como fallback.
+    Se nenhum iframe for encontrado, devolve (page, page).
     """
     frame_menu     = None
     frame_conteudo = None
 
-    for f in page.frames:
-        try:
-            html = f.content()
-        except Exception:
-            continue
-        if frame_menu is None and any(k in html for k in _MENU_KEYWORDS):
+    # Ignora o frame principal (index 0) que é a página toda
+    frames_filhos = [f for f in page.frames if f != page.main_frame]
+
+    # 1ª tentativa: URL do frame
+    for f in frames_filhos:
+        url = f.url or ""
+        if frame_menu is None and any(k in url for k in _URL_MENU):
             frame_menu = f
-        if frame_conteudo is None and any(k in html for k in _CONTENT_KEYWORDS):
+        if frame_conteudo is None and any(k in url for k in _URL_CONTENT):
             frame_conteudo = f
+
+    # 2ª tentativa: conteúdo HTML
+    if frame_menu is None or frame_conteudo is None:
+        for f in frames_filhos:
+            try:
+                html = f.content()
+            except Exception:
+                continue
+            if frame_menu is None and any(k in html for k in _HTML_MENU):
+                frame_menu = f
+            if frame_conteudo is None and any(k in html for k in _HTML_CONTENT):
+                frame_conteudo = f
 
     return frame_menu or page, frame_conteudo or page
 
 
 # ── Árvore de navegação ───────────────────────────────────────────────────────
 
+# Seletor CSS para o container raiz da árvore ASP.NET no layout PINI.
+# O TreeView é renderizado dentro de um <div> com id contendo 'TreeView'.
+# Usar este container garante que NADA fora dele (header, nav, Vizca) seja tocado.
+_SEL_TREE_CONTAINER = (
+    "[id*='TreeView'], [id*='treeView'], "
+    "[id*='TreeMenu'], [id*='treeMenu'], "
+    "[id*='menuLateral'], [id*='MenuLateral']"
+)
+
+# Padrão ASP.NET TreeView para nós de expand/collapse: __doPostBack('t','sN\'...')
+_EXPAND_ONCLICK = re.compile(
+    r"TreeView_Toggle|__doPostBack\('[^']*','[tT]\d+\\", re.IGNORECASE
+)
+# Padrão de link folha (categoria): __doPostBack com parâmetro de nó simples
+_LEAF_ONCLICK = re.compile(
+    r"__doPostBack\s*\(", re.IGNORECASE
+)
+# Itens de navegação a excluir (header, user menu, etc.)
+_NAV_EXCLUSOES = re.compile(
+    r"vizca|sair|logout|entrar|login|info|ajuda|help|home|assine|contato",
+    re.IGNORECASE
+)
+
+
+def _tree_container(frame):
+    """
+    Retorna o locator do container da árvore dentro do frame.
+    Se não encontrar o container específico, retorna None — não usa
+    o frame inteiro para evitar pegar elementos do cabeçalho.
+    """
+    loc = frame.locator(_SEL_TREE_CONTAINER)
+    if loc.count() > 0:
+        return loc.first
+    return None
+
+
 def expandir_arvore(frame_menu):
-    """Clica em todos os ícones de expansão (+) até não restar nenhum."""
+    """
+    Expande todos os nós colapsados do ASP.NET TreeView usando JavaScript.
+
+    No ASP.NET TreeView cada botão de expand/collapse tem um <img> com id
+    no padrão '{prefix}t{nodeKey}' e o div de filhos correspondente tem id
+    '{prefix}n{nodeKey}Nodes'. Se esse div estiver display:none, o nó está
+    colapsado e clicamos na imagem para abrir.
+    """
     print("  Expandindo nós da árvore...", end="", flush=True)
     iteracoes = 0
     while iteracoes < 60:
-        nos = frame_menu.locator(
-            "img[src*='plus'], img[src*='Expand'], img[src*='expand'], "
-            "img[src*='collapsed'], a[title*='Expandir'], "
-            "span.TreeExpand, td.TreeExpand"
-        ).all()
-        clicou = False
-        for no in nos:
-            try:
-                if no.is_visible():
-                    no.click()
-                    time.sleep(0.35)
-                    clicou = True
-            except Exception:
-                continue
-        if not clicou:
+        expandiu = frame_menu.evaluate("""
+            () => {
+                let count = 0;
+                // Todas as imagens de toggle do TreeView
+                const imgs = document.querySelectorAll("img[onclick*='TreeView_Toggle']");
+                for (const img of imgs) {
+                    if (!img.id) continue;
+                    // Transforma o id da imagem no id do div de filhos:
+                    //   {prefix}t{key}  →  {prefix}n{key}Nodes
+                    // Cobre nós simples (t0) e aninhados (t0_0, t0_0_1, ...)
+                    const divId = img.id.replace(/t(\\d[\\d_]*)$/, 'n$1Nodes');
+                    if (divId === img.id) continue; // padrão não casou
+                    const nodesDiv = document.getElementById(divId);
+                    if (nodesDiv && nodesDiv.style.display === 'none') {
+                        img.click();
+                        count++;
+                    }
+                }
+                return count;
+            }
+        """)
+        if not expandiu:
             break
+        time.sleep(0.6)
         iteracoes += 1
     print(f" pronto ({iteracoes} rodadas).")
-
-
-# Padrão ASP.NET TreeView para nós de expand/collapse: __doPostBack('Ctrl','s0\...')
-_EXPAND_PATTERN = re.compile(r"__doPostBack\([^)]*'[sSlLcC]\d+\\", re.IGNORECASE)
 
 
 def listar_links_categorias(frame_menu):
     """
     Retorna lista de dicts {texto, href, onclick} para todos os links
-    que parecem ser folhas da árvore (navegam para conteúdo).
+    de categorias da árvore usando JavaScript.
+    O JS percorre apenas o container do TreeView e retorna os links
+    que NÃO são de expansão/colapso e NÃO são de navegação de sistema.
     """
-    links  = []
-    vistos = set()
+    links_js = frame_menu.evaluate("""
+        () => {
+            // Localizar o container do TreeView pelo id
+            const container = (
+                document.querySelector("[id*='TreeView']") ||
+                document.querySelector("[id*='TreeMenu']") ||
+                document.querySelector("[id*='menuLateral']")
+            );
+            if (!container) return [];
 
-    for el in frame_menu.locator("a").all():
-        try:
-            texto   = el.inner_text().strip()
-            href    = el.get_attribute("href")    or ""
-            onclick = el.get_attribute("onclick") or ""
+            const NAV = /vizca|sair|logout|entrar|login|home|assine|contato|info/i;
+            const result = [];
+            const seen   = new Set();
 
-            if not texto or len(texto) < 2:
-                continue
+            for (const a of container.querySelectorAll('a')) {
+                const texto   = (a.innerText || '').trim();
+                const href    = a.getAttribute('href')    || '';
+                const onclick = a.getAttribute('onclick') || '';
 
-            # Pular nós de expansão/colapso do ASP.NET TreeView
-            if _EXPAND_PATTERN.search(onclick):
-                continue
+                if (!texto || texto.length < 2)      continue;
+                if (NAV.test(texto))                  continue;
+                // Pular links de expand/collapse do TreeView
+                if (/TreeView_Toggle/i.test(href))    continue;
+                if (/TreeView_Toggle/i.test(onclick)) continue;
+                // Pular links externos
+                if (href.startsWith('http'))          continue;
+                // Precisam ter algum destino
+                if (!href && !onclick)                continue;
 
-            # Pular âncoras sem destino
-            if not href and not onclick:
-                continue
+                const chave = texto + '|' + href + '|' + onclick;
+                if (seen.has(chave)) continue;
+                seen.add(chave);
 
-            chave = (texto, href, onclick)
-            if chave in vistos:
-                continue
-            vistos.add(chave)
-
-            links.append({"texto": texto, "href": href, "onclick": onclick})
-        except Exception:
-            continue
-
-    return links
+                result.push({texto, href, onclick});
+            }
+            return result;
+        }
+    """)
+    return links_js or []
 
 
 # ── Extração de tabela ────────────────────────────────────────────────────────
@@ -367,38 +477,31 @@ def selecionar_banco_tcpo_pini(frame_menu):
 
 def configurar_filtros_busca(page):
     """
-    Abre a busca avançada (botão verde com ícone de chave) e marca
-    a opção 'Procurar somente na BASE SELECIONADA'.
+    Abre a busca avançada (botão verde com ícone de chave, ao lado do campo
+    de busca) e marca a opção 'Procurar somente na BASE SELECIONADA'.
+
+    IMPORTANTE: os seletores são propositalmente escopados ao container do
+    campo de busca para NÃO confundir com links de navegação (ex: menu do
+    usuário 'Vizca') que também aparecem na página.
     """
     print("  Configurando filtros de busca avançada...")
 
-    # Clicar no botão verde de busca avançada
-    btn_seletores = [
-        "img[src*='avancada']", "img[src*='Avancada']", "img[src*='advanced']",
-        "img[src*='chave']",    "img[src*='wrench']",   "img[src*='tool']",
-        "a[title*='vançada']",  "a[title*='Advanced']",
-        "input[title*='vançada']",
-        # botão verde identificado pela cor/classe
-        "button.green", "a.btnAvancada", "#btnBuscaAvancada",
-        # fallback: imagem logo após o campo de busca
-        "#imgBuscaAvancada", "img.buscaAvancada",
-    ]
+    # ID exato do botão verde inspecionado no sistema
+    SEL_BTN = "#ctl00_MainContent_imgBtnBuscaAvancada"
 
     alvos = [page] + list(page.frames)
     clicou_btn = False
+
     for alvo in alvos:
-        for sel in btn_seletores:
-            try:
-                loc = alvo.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible(timeout=2_000):
-                    loc.first.click()
-                    time.sleep(0.8)
-                    clicou_btn = True
-                    break
-            except Exception:
-                continue
-        if clicou_btn:
-            break
+        try:
+            loc = alvo.locator(SEL_BTN)
+            if loc.count() > 0 and loc.first.is_visible(timeout=3_000):
+                loc.first.click()
+                time.sleep(0.8)
+                clicou_btn = True
+                break
+        except Exception:
+            pass
 
     if not clicou_btn:
         print("  [!] Botão de busca avançada não encontrado; tentando localizar o painel diretamente.")
@@ -488,7 +591,10 @@ def main():
         print("\n[2] Identificando layout da página...")
         time.sleep(2)
         frame_menu, _ = identificar_frames(page)
-        print(f"    Frame menu identificado: {frame_menu.name or 'página principal'}")
+        frame_url = getattr(frame_menu, "url", "") or ""
+        print(f"    Frame menu: {frame_url or 'página principal'}")
+        container = _tree_container(frame_menu)
+        print(f"    Container da árvore: {'encontrado' if container else 'NÃO ENCONTRADO — inspecione o id do div da árvore'}")
 
         # 3. Selecionar banco TCPO PINI e configurar filtros
         print(f"\n[3] Selecionando banco '{BANCO_ALVO}'...")
@@ -525,22 +631,41 @@ def main():
             try:
                 fm, fc = identificar_frames(page)
 
-                # Localizar o link pelo texto exato para evitar referências obsoletas
-                el = fm.locator("a").filter(
-                    has_text=re.compile(r"^\s*" + re.escape(texto) + r"\s*$")
-                ).first
+                # Clicar via JavaScript usando o href/onclick exato capturado
+                # pelo listar_links_categorias. Isso evita depender de
+                # visibilidade do elemento (que falha em nós ainda colapsados)
+                # e evita confundir com elementos do cabeçalho.
+                href    = lnk["href"]
+                onclick = lnk["onclick"]
 
-                try:
-                    el.scroll_into_view_if_needed(timeout=3_000)
-                except Exception:
-                    pass
+                clicou = fm.evaluate("""
+                    ([href, onclick, texto]) => {
+                        // Procura dentro do container da árvore pelo href OU onclick exatos
+                        const container = (
+                            document.querySelector("[id*='TreeView']") ||
+                            document.querySelector("[id*='TreeMenu']") ||
+                            document.querySelector("[id*='menuLateral']")
+                        );
+                        if (!container) return false;
+                        for (const a of container.querySelectorAll('a')) {
+                            const aHref    = a.getAttribute('href')    || '';
+                            const aOnclick = a.getAttribute('onclick') || '';
+                            const aTexto   = (a.innerText || '').trim();
+                            if (aTexto === texto &&
+                                (aHref === href || aOnclick === onclick)) {
+                                a.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                """, [href, onclick, texto])
 
-                if not el.is_visible():
-                    print("      → Elemento não visível, pulando.")
+                if not clicou:
+                    print("      → Link não encontrado no DOM, pulando.")
                     continue
 
-                el.click()
-                time.sleep(SLOW_MO / 1000 + 0.5)
+                time.sleep(SLOW_MO / 1000 + 0.8)
 
                 _, fc = identificar_frames(page)
                 dados = extrair_dados_categoria(fc)
