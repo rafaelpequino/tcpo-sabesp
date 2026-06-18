@@ -1,6 +1,5 @@
 # env files    
 .env
-.env.*
 
 # excel
 .xlsx
