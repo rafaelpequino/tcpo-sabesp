@@ -57,10 +57,11 @@ def salvar_excel(dados, status):
 
 
 def exportar_insumos(navegador):
-    wait = WebDriverWait(navegador, 15)
+    wait = WebDriverWait(navegador, 12)
+    wait_rapido = WebDriverWait(navegador, 10)
     
     insumos = {
-        #"Materiais": "ctl00_MainContent_PiniTreeViewt304",
+        "Materiais": "ctl00_MainContent_PiniTreeViewt304",
         "Mão de obra": "ctl00_MainContent_PiniTreeViewt305",
         "Mão de obra empreitada": "ctl00_MainContent_PiniTreeViewt306",
         "Serviços terceirizados": "ctl00_MainContent_PiniTreeViewt307",
@@ -82,15 +83,13 @@ def exportar_insumos(navegador):
             """)
         except Exception as e:
             print(f"Aviso: Não foi possível modificar a árvore: {e}")
-        
-        sleep(1)
 
         for categoria, id_elemento in insumos.items():
             print(f"\n=== Processando Categoria: {categoria} ===")
             try:
                 btnCategoria = wait.until(EC.element_to_be_clickable((By.ID, id_elemento)))
                 btnCategoria.click()
-                sleep(3)
+                sleep(0.3)
 
                 elemento = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_btnServicos")))
                 texto = elemento.get_attribute("value")
@@ -103,7 +102,6 @@ def exportar_insumos(navegador):
                     
                 paginas = int(match.group(1))
                 print(f"Total de páginas a processar: {paginas}")
-                sleep(1)
 
                 for pagina in range(1, paginas + 1):
                     print(f"\nProcessando página {pagina}/{paginas}")
@@ -111,11 +109,12 @@ def exportar_insumos(navegador):
                     try:
                         indice_tr = 2
                         max_retries = 3
+                        pagina_processada = False
 
                         while True:
                             try:
                                 # Aguarda presença da tabela
-                                wait.until(EC.presence_of_all_elements_located(
+                                wait_rapido.until(EC.presence_of_all_elements_located(
                                     (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
                                 ))
 
@@ -125,41 +124,36 @@ def exportar_insumos(navegador):
                                 )
 
                                 if indice_tr >= len(trs) - 1:
-                                    print(f"Fim da página. Total de linhas: {len(trs)}")
+                                    print(f"Fim da página. Total de linhas processadas: {indice_tr - 2}")
+                                    pagina_processada = True
                                     break
 
                                 tr = trs[indice_tr]
                                 tds = tr.find_elements(By.TAG_NAME, "td")
 
                                 if len(tds) < 3:
-                                    print(f"Linha {indice_tr} não tem dados suficientes. Pulando...")
                                     indice_tr += 1
                                     continue
 
                                 dados_item = [td.text for td in tds]
-                                print(f"Item {indice_tr}: {dados_item[1]} - {dados_item[2][:50]}...")
 
                                 # Clica no código do item com retry
                                 retry_count = 0
                                 while retry_count < max_retries:
                                     try:
                                         link = tds[1].find_element(By.TAG_NAME, "a")
-                                        navegador.execute_script("arguments[0].scrollIntoView(true);", link)
-                                        sleep(0.5)
                                         link.click()
                                         break
                                     except StaleElementReferenceException:
                                         retry_count += 1
                                         if retry_count >= max_retries:
-                                            print(f"Erro: Elemento se tornou stale após {max_retries} tentativas")
                                             raise
-                                        sleep(1)
+                                        sleep(0.2)
 
                                 # Aguarda dados de insumo
-                                wait.until(EC.presence_of_element_located(
+                                wait_rapido.until(EC.presence_of_element_located(
                                     (By.CSS_SELECTOR, "#ctl00_MainContent_gvInsumo > tbody > tr:nth-child(2)")
                                 ))
-                                sleep(1)
 
                                 tr_insumo = navegador.find_element(
                                     By.CSS_SELECTOR,
@@ -172,7 +166,7 @@ def exportar_insumos(navegador):
 
                                 dados_item.extend(dados_insumo)
                                 dados_excel.append(dados_item)
-                                print(f"Dados coletados: {len(dados_excel)} itens no total")
+                                print(f"[{len(dados_excel)}] {dados_item[1]}")
 
                                 # Retorna para a lista com retry
                                 retry_count = 0
@@ -188,72 +182,79 @@ def exportar_insumos(navegador):
                                         retry_count += 1
                                         if retry_count >= max_retries:
                                             raise
-                                        sleep(1)
+                                        sleep(0.2)
 
-                                wait.until(EC.presence_of_all_elements_located(
+                                wait_rapido.until(EC.presence_of_all_elements_located(
                                     (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
                                 ))
-                                sleep(1)
 
                                 indice_tr += 1
 
                             except StaleElementReferenceException as e:
-                                print(f"Elemento ficou stale. Tentando novamente...")
-                                sleep(2)
+                                sleep(0.2)
                                 continue
                             except TimeoutException as e:
-                                print(f"Timeout ao processar linha {indice_tr}: {e}")
-                                break
+                                # Timeout - item pode estar fora de alcance, tenta próximo
+                                print(f"[Timeout na linha {indice_tr}, continuando...]")
+                                indice_tr += 1
+                                continue
                             except Exception as e:
                                 print(f"Erro ao processar linha {indice_tr}: {e}")
                                 indice_tr += 1
                                 continue
 
-                        # Avança para próxima página
-                        if pagina < paginas:
-                            print(f"Avançando para próxima página...")
-                            try:
-                                links = navegador.find_elements(
-                                    By.CSS_SELECTOR,
-                                    "#ctl00_MainContent_gvServicos tr.gridPager td table tbody tr td a"
-                                )
+                        # Avança para próxima página SOMENTE se ainda há páginas
+                        if pagina_processada and pagina < paginas:
+                            print(f"Avançando para página {pagina + 1}...")
+                            tentativas_nav = 0
+                            navegou = False
+                            
+                            while tentativas_nav < 2 and not navegou:
+                                try:
+                                    links = navegador.find_elements(
+                                        By.CSS_SELECTOR,
+                                        "#ctl00_MainContent_gvServicos tr.gridPager td table tbody tr td a"
+                                    )
 
-                                proxima_pagina = str(pagina + 1)
-                                link_proxima = None
+                                    proxima_pagina = str(pagina + 1)
+                                    link_proxima = None
 
-                                for link in links:
-                                    if link.text.strip() == proxima_pagina:
-                                        link_proxima = link
-                                        break
+                                    for link in links:
+                                        if link.text.strip() == proxima_pagina:
+                                            link_proxima = link
+                                            break
 
-                                if link_proxima:
-                                    navegador.execute_script("arguments[0].scrollIntoView(true);", link_proxima)
-                                    sleep(0.5)
-                                    link_proxima.click()
-                                else:
-                                    # Procura pelos botões de reticências
-                                    botoes_reticencias = [
-                                        link for link in links
-                                        if link.text.strip() == "..."
-                                    ]
-
-                                    if botoes_reticencias:
-                                        print("Avançando bloco de páginas...")
-                                        navegador.execute_script("arguments[0].scrollIntoView(true);", botoes_reticencias[-1])
-                                        sleep(0.5)
-                                        botoes_reticencias[-1].click()
+                                    if link_proxima:
+                                        link_proxima.click()
+                                        navegou = True
                                     else:
-                                        print("Não encontrei próxima página")
+                                        # Procura pelos botões de reticências
+                                        botoes_reticencias = [
+                                            link for link in links
+                                            if link.text.strip() == "..."
+                                        ]
+
+                                        if botoes_reticencias:
+                                            botoes_reticencias[-1].click()
+                                            navegou = True
+                                        else:
+                                            print(f"Aviso: Não encontrei botão para próxima página")
+                                            break
+
+                                    if navegou:
+                                        wait_rapido.until(EC.presence_of_all_elements_located(
+                                            (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
+                                        ))
+                                        sleep(0.1)
+                                        
+                                except Exception as e:
+                                    tentativas_nav += 1
+                                    if tentativas_nav < 2:
+                                        sleep(0.5)
+                                        continue
+                                    else:
+                                        print(f"Erro ao navegar para próxima página: {e}")
                                         break
-
-                                wait.until(EC.presence_of_all_elements_located(
-                                    (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
-                                ))
-                                sleep(2)
-
-                            except Exception as e:
-                                print(f"Erro ao navegar para próxima página: {e}")
-                                break
 
                     except KeyboardInterrupt:
                         raise
