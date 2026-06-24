@@ -28,6 +28,26 @@ options.add_experimental_option('useAutomationExtension', False)
 
 url = "https://tcpoweb.pini.com.br/home/home.aspx"
 
+def aguardar_conexao(tentativa_num):
+    """Aguarda o usuário reestabelecer a conexão"""
+    print("\n" + "=" * 70)
+    print("⚠️  CONEXÃO PERDIDA - AGUARDANDO RECONEXÃO")
+    print("=" * 70)
+    print(f"\nTentativa {tentativa_num} de reconexão")
+    print("\nOpções:")
+    print("1. Pressione ENTER para tentar continuar quando a internet voltar")
+    print("2. Pressione 'Q' + ENTER para cancelar a automação")
+    print("\n" + "-" * 70)
+    
+    resposta = input("\nAguardando sua resposta: ").strip().upper()
+    
+    if resposta == 'Q':
+        print("\n✗ Automação cancelada pelo usuário.")
+        return False
+    
+    print("\n✓ Tentando reconectar...")
+    return True
+
 def salvar_excel(dados, status):
     pasta = "arquivos"
 
@@ -110,6 +130,8 @@ def exportar_insumos(navegador):
                         indice_tr = 2
                         max_retries = 3
                         pagina_processada = False
+                        timeout_consecutivos = 0
+                        indice_primeiro_timeout = None
 
                         while True:
                             try:
@@ -154,6 +176,7 @@ def exportar_insumos(navegador):
                                 wait_rapido.until(EC.presence_of_element_located(
                                     (By.CSS_SELECTOR, "#ctl00_MainContent_gvInsumo > tbody > tr:nth-child(2)")
                                 ))
+                                sleep(0.2)
 
                                 tr_insumo = navegador.find_element(
                                     By.CSS_SELECTOR,
@@ -184,18 +207,41 @@ def exportar_insumos(navegador):
                                             raise
                                         sleep(0.2)
 
+                                # AGUARDA a página voltar COMPLETAMENTE antes de continuar
+                                sleep(0.5)  # Aguarda física para página processar
                                 wait_rapido.until(EC.presence_of_all_elements_located(
                                     (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
                                 ))
+                                sleep(0.2)  # Aguarda mais um pouco para DOM estabilizar
 
                                 indice_tr += 1
 
                             except StaleElementReferenceException as e:
                                 sleep(0.2)
+                                timeout_consecutivos = 0  # Reset contador
+                                indice_primeiro_timeout = None
                                 continue
                             except TimeoutException as e:
-                                # Timeout - item pode estar fora de alcance, tenta próximo
-                                print(f"[Timeout na linha {indice_tr}, continuando...]")
+                                # Conta timeouts consecutivos
+                                if indice_primeiro_timeout is None:
+                                    indice_primeiro_timeout = indice_tr
+                                
+                                timeout_consecutivos += 1
+                                
+                                if timeout_consecutivos >= 3:
+                                    # 3+ timeouts = problema de conexão
+                                    if not aguardar_conexao(timeout_consecutivos):
+                                        raise KeyboardInterrupt("Usuário cancelou após perda de conexão")
+                                    
+                                    # Volta para o primeiro item com timeout
+                                    print(f"\n✓ Reconectado! Voltando para linha {indice_primeiro_timeout}...\n")
+                                    indice_tr = indice_primeiro_timeout
+                                    timeout_consecutivos = 0
+                                    indice_primeiro_timeout = None
+                                    sleep(1)
+                                    continue
+                                
+                                # Menos de 3 timeouts - continue normalmente
                                 indice_tr += 1
                                 continue
                             except Exception as e:
