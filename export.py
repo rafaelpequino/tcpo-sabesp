@@ -9,6 +9,7 @@ from selenium.webdriver.support.ui import Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException, WebDriverException
 from utils.auth import login, acessar_banco, encerrar
+from utils import db
 import re
 import os
 from datetime import datetime
@@ -23,8 +24,23 @@ options.add_argument("--disable-gpu")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--disable-extensions")
+# Redução de consumo de memória
+options.add_argument("--aggressive-cache-discard")
+options.add_argument("--disk-cache-size=0")
+options.add_argument("--media-cache-size=0")
+options.add_argument("--js-flags=--max-old-space-size=512")
+options.add_argument("--disable-background-networking")
+options.add_argument("--disable-default-apps")
+options.add_argument("--disable-sync")
+options.add_argument("--disable-translate")
+options.add_argument("--no-first-run")
 options.add_experimental_option("excludeSwitches", ["enable-automation"])
 options.add_experimental_option('useAutomationExtension', False)
+# Desabilita carregamento de imagens (maior economia de memória e banda)
+options.add_experimental_option("prefs", {
+    "profile.managed_default_content_settings.images": 2,
+    "profile.default_content_setting_values.notifications": 2
+})
 
 url = "https://tcpoweb.pini.com.br/home/home.aspx"
 
@@ -89,9 +105,10 @@ def exportar_insumos(navegador):
         "Equipamentos - Locação": "ctl00_MainContent_PiniTreeViewt309"
     }
 
-    dados_excel = []
+    total_salvos = 0
 
     try:
+        db.criar_tabela_insumos()
         print("Iniciando leitura de insumos...")
 
         # Desabilita elementos ocultos
@@ -123,9 +140,37 @@ def exportar_insumos(navegador):
                 paginas = int(match.group(1))
                 print(f"Total de páginas a processar: {paginas}")
 
-                for pagina in range(1, paginas + 1):
-                    print(f"\nProcessando página {pagina}/{paginas}")
+                # Se há mais de 3 páginas, pergunta a partir de qual começar
+                pagina_inicial = 1
+                if paginas > 3:
+                    while True:
+                        resposta = input(f"  A partir de qual página deseja começar? [1-{paginas}, ENTER para começar do início]: ").strip()
+                        if resposta == "":
+                            pagina_inicial = 1
+                            break
+                        if resposta.isdigit():
+                            valor = int(resposta)
+                            if 1 <= valor <= paginas:
+                                pagina_inicial = valor
+                                break
+                        print(f"  Valor inválido. Digite um número entre 1 e {paginas}.")
                     
+                    if pagina_inicial > 1:
+                        print(f"\n  Navegue manualmente para a página {pagina_inicial} no navegador")
+                        print(f"  e pressione ENTER quando estiver pronto.")
+                        input("  Aguardando ENTER... ")
+                        sleep(1)
+
+                for pagina in range(pagina_inicial, paginas + 1):
+                    print(f"\nProcessando página {pagina}/{paginas}")
+
+                    # Limpa cache do navegador a cada 5 páginas para controlar uso de memória
+                    if pagina % 5 == 0:
+                        try:
+                            navegador.execute_cdp_cmd("Network.clearBrowserCache", {})
+                        except Exception:
+                            pass
+
                     try:
                         indice_tr = 2
                         max_retries = 3
@@ -159,6 +204,12 @@ def exportar_insumos(navegador):
 
                                 dados_item = [td.text for td in tds]
 
+                                # Verifica se o item já foi extraído hoje
+                                if db.item_ja_extraido_hoje(dados_item[1].strip()):
+                                    print(f"  ↷ Pulando {dados_item[1].strip()} (já extraído hoje)")
+                                    indice_tr += 1
+                                    continue
+
                                 # Clica no código do item com retry
                                 retry_count = 0
                                 while retry_count < max_retries:
@@ -188,8 +239,17 @@ def exportar_insumos(navegador):
                                 ]
 
                                 dados_item.extend(dados_insumo)
-                                dados_excel.append(dados_item)
-                                print(f"[{len(dados_excel)}] {dados_item[1]}")
+                                db.salvar_insumo(
+                                    base=dados_item[0],
+                                    item=dados_item[1],
+                                    descricao=dados_item[2],
+                                    unidade=dados_item[3],
+                                    tipo=dados_item[4],
+                                    data_preco=dados_item[5],
+                                    preco_str=dados_item[6]
+                                )
+                                total_salvos += 1
+                                print(f"[{total_salvos}] {dados_item[1]}")
 
                                 # Retorna para a lista com retry
                                 retry_count = 0
@@ -251,56 +311,116 @@ def exportar_insumos(navegador):
 
                         # Avança para próxima página SOMENTE se ainda há páginas
                         if pagina_processada and pagina < paginas:
-                            print(f"Avançando para página {pagina + 1}...")
-                            tentativas_nav = 0
-                            navegou = False
-                            
-                            while tentativas_nav < 2 and not navegou:
+                            proxima_pagina_num = pagina + 1
+                            print(f"Avançando para página {proxima_pagina_num}...")
+
+                            def _pagina_atual():
+                                """Lê o número da página atual a partir do texto 'Página X de Y' do botão"""
                                 try:
-                                    links = navegador.find_elements(
+                                    btn = navegador.find_element(By.ID, "ctl00_MainContent_btnServicos")
+                                    texto = btn.get_attribute("value")
+                                    m = re.search(r'Página (\d+) de', texto)
+                                    return int(m.group(1)) if m else None
+                                except Exception:
+                                    return None
+
+                            def _aguardar_tabela():
+                                """Aguarda a tabela de serviços carregar"""
+                                sleep(2)
+                                wait_rapido.until(EC.presence_of_all_elements_located(
+                                    (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
+                                ))
+                                sleep(0.5)
+
+                            def _esta_na_pagina(numero):
+                                """Verifica se a página atual é a correta lendo 'Página X de Y' do botão"""
+                                return _pagina_atual() == numero
+
+                            def _pedir_navegacao_manual(numero):
+                                """Congela e pede que o usuário navegue manualmente para a página"""
+                                print("\n" + "=" * 70)
+                                print("⚠️  NÃO FOI POSSÍVEL NAVEGAR AUTOMATICAMENTE")
+                                print("=" * 70)
+                                print(f"\nNão consegui ir para a página {numero} automaticamente.")
+                                print(f"\nPOR FAVOR:")
+                                print(f"  1. Navegue MANUALMENTE para a página {numero} no navegador")
+                                print(f"  2. Aguarde a página carregar completamente")
+                                print(f"  3. Pressione ENTER aqui no terminal para continuar")
+                                print(f"     (ou digite 'Q' + ENTER para encerrar)\n")
+                                resposta = input("Aguardando: ").strip().upper()
+                                if resposta == 'Q':
+                                    raise KeyboardInterrupt("Usuário cancelou após falha de navegação")
+                                print("✓ Continuando...\n")
+
+                            # --- Loop de navegação ---
+                            max_tentativas = 6
+                            tentativa = 0
+                            navegou = False
+
+                            while tentativa < max_tentativas and not navegou:
+                                try:
+                                    # Coleta os links de paginação atuais
+                                    links_pager = navegador.find_elements(
                                         By.CSS_SELECTOR,
                                         "#ctl00_MainContent_gvServicos tr.gridPager td table tbody tr td a"
                                     )
+                                    numero_str = str(proxima_pagina_num)
 
-                                    proxima_pagina = str(pagina + 1)
-                                    link_proxima = None
+                                    # Procura link clicável com o número da próxima página
+                                    link_alvo = next(
+                                        (l for l in links_pager if l.text.strip() == numero_str),
+                                        None
+                                    )
 
-                                    for link in links:
-                                        if link.text.strip() == proxima_pagina:
-                                            link_proxima = link
-                                            break
+                                    if link_alvo:
+                                        # Encontrou o link — clica diretamente
+                                        navegador.execute_script("arguments[0].scrollIntoView(true);", link_alvo)
+                                        sleep(0.2)
+                                        link_alvo.click()
+                                        print(f"  Clicou no link '{proxima_pagina_num}', aguardando carregar...")
+                                        _aguardar_tabela()
 
-                                    if link_proxima:
-                                        link_proxima.click()
-                                        navegou = True
-                                    else:
-                                        # Procura pelos botões de reticências
-                                        botoes_reticencias = [
-                                            link for link in links
-                                            if link.text.strip() == "..."
-                                        ]
-
-                                        if botoes_reticencias:
-                                            botoes_reticencias[-1].click()
+                                        if _esta_na_pagina(proxima_pagina_num):
+                                            print(f"  ✓ Página {proxima_pagina_num} carregada com sucesso")
                                             navegou = True
                                         else:
-                                            print(f"Aviso: Não encontrei botão para próxima página")
-                                            break
-
-                                    if navegou:
-                                        wait_rapido.until(EC.presence_of_all_elements_located(
-                                            (By.CSS_SELECTOR, "#ctl00_MainContent_gvServicos > tbody > tr")
-                                        ))
-                                        sleep(0.1)
-                                        
-                                except Exception as e:
-                                    tentativas_nav += 1
-                                    if tentativas_nav < 2:
-                                        sleep(0.5)
-                                        continue
+                                            tentativa += 1
+                                            print(f"  ⚠ Página ainda não mudou (tentativa {tentativa}/{max_tentativas})")
+                                            sleep(0.5)
                                     else:
-                                        print(f"Erro ao navegar para próxima página: {e}")
-                                        break
+                                        # Link não visível — clica em "..." (que no ASP.NET já NAVEGA para o próximo grupo)
+                                        botoes_reticencias = [l for l in links_pager if l.text.strip() == "..."]
+
+                                        if botoes_reticencias:
+                                            print(f"  Página {proxima_pagina_num} não está visível, clicando em '...'")
+                                            botoes_reticencias[-1].click()
+                                            _aguardar_tabela()
+
+                                            pagina_obtida = _pagina_atual()
+                                            if pagina_obtida == proxima_pagina_num:
+                                                print(f"  ✓ Página {proxima_pagina_num} carregada via '...'")
+                                                navegou = True
+                                            else:
+                                                tentativa += 1
+                                                desc = f"página {pagina_obtida}" if pagina_obtida else "página desconhecida"
+                                                print(f"  ⚠ '...' navegou para {desc}, não para {proxima_pagina_num} (tentativa {tentativa}/{max_tentativas})")
+                                                sleep(0.5)
+                                        else:
+                                            tentativa += 1
+                                            print(f"  ⚠ Sem link '{proxima_pagina_num}' e sem '...' visível (tentativa {tentativa})")
+                                            sleep(0.5)
+
+                                except StaleElementReferenceException:
+                                    tentativa += 1
+                                    sleep(0.5)
+                                except Exception as e:
+                                    print(f"  Erro: {str(e)[:80]}")
+                                    tentativa += 1
+                                    sleep(0.5)
+
+                            if not navegou:
+                                # Esgotou tentativas automáticas — congela e pede ajuda do usuário
+                                _pedir_navegacao_manual(proxima_pagina_num)
 
                     except KeyboardInterrupt:
                         raise
@@ -329,12 +449,10 @@ def exportar_insumos(navegador):
         status = "ERRO"
 
     finally:
-        if dados_excel:
-            salvar_excel(dados_excel, status)
+        if total_salvos > 0:
+            print(f"Processo {status.lower()}. Total de {total_salvos} itens salvos no banco.")
         else:
             print("Nenhum dado foi coletado.")
-
-        print(f"Processo {status.lower()}. Total de {len(dados_excel)} itens coletados.")
 
 
 def main():
