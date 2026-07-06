@@ -56,14 +56,14 @@ def criar_tabela_insumos():
 
 
 def item_ja_extraido_hoje(item: str) -> bool:
-    """Retorna True se já existe um registro com esse Item extraído hoje (horário de Brasília)."""
+    """Retorna True se já existe um registro com esse Item extraído nos últimos 7 dias (horário de Brasília)."""
     brasilia = pytz.timezone("America/Sao_Paulo")
     hoje = datetime.now(brasilia).date()
 
     conn = _conectar()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT 1 FROM insumos WHERE Item = ? AND CAST(DtExtracao AS DATE) = ?",
+        "SELECT 1 FROM insumos WHERE Item = ? AND CAST(DtExtracao AS DATE) >= DATEADD(day, -7, ?)",
         item,
         str(hoje)
     )

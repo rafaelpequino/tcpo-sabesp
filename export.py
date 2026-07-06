@@ -125,8 +125,21 @@ def exportar_insumos(navegador):
             print(f"\n=== Processando Categoria: {categoria} ===")
             try:
                 btnCategoria = wait.until(EC.element_to_be_clickable((By.ID, id_elemento)))
+
+                # Guarda referência ao botão atual para detectar quando a página recarregar
+                try:
+                    btn_servicos_antigo = navegador.find_element(By.ID, "ctl00_MainContent_btnServicos")
+                except NoSuchElementException:
+                    btn_servicos_antigo = None
+
                 btnCategoria.click()
-                sleep(0.3)
+
+                # Aguarda o elemento ficar stale (página recarregou) antes de ler os dados da nova categoria
+                if btn_servicos_antigo is not None:
+                    try:
+                        wait.until(EC.staleness_of(btn_servicos_antigo))
+                    except TimeoutException:
+                        pass
 
                 elemento = wait.until(EC.presence_of_element_located((By.ID, "ctl00_MainContent_btnServicos")))
                 texto = elemento.get_attribute("value")
@@ -161,6 +174,11 @@ def exportar_insumos(navegador):
                         input("  Aguardando ENTER... ")
                         sleep(1)
 
+                # Categoria com página única: pula só a 1ª linha e lê até o fim (sem linha de paginação)
+                # Categoria com múltiplas páginas: pula as 2 primeiras e para antes da última (linha de paginação)
+                tr_inicio = 1 if paginas == 1 else 2
+                tr_fim_offset = 0 if paginas == 1 else 1
+
                 for pagina in range(pagina_inicial, paginas + 1):
                     print(f"\nProcessando página {pagina}/{paginas}")
 
@@ -172,7 +190,7 @@ def exportar_insumos(navegador):
                             pass
 
                     try:
-                        indice_tr = 2
+                        indice_tr = tr_inicio
                         max_retries = 3
                         pagina_processada = False
                         timeout_consecutivos = 0
@@ -190,8 +208,8 @@ def exportar_insumos(navegador):
                                     "#ctl00_MainContent_gvServicos > tbody > tr"
                                 )
 
-                                if indice_tr >= len(trs) - 1:
-                                    print(f"Fim da página. Total de linhas processadas: {indice_tr - 2}")
+                                if indice_tr >= len(trs) - tr_fim_offset:
+                                    print(f"Fim da página. Total de linhas processadas: {indice_tr - tr_inicio}")
                                     pagina_processada = True
                                     break
 
@@ -359,6 +377,13 @@ def exportar_insumos(navegador):
 
                             while tentativa < max_tentativas and not navegou:
                                 try:
+                                    # Verifica de imediato: se já estamos na página alvo (ex.: click anterior funcionou
+                                    # mas a verificação pós-click falhou por timing), encerra sem tentar de novo
+                                    if _esta_na_pagina(proxima_pagina_num):
+                                        print(f"  ✓ Página {proxima_pagina_num} carregada com sucesso")
+                                        navegou = True
+                                        break
+
                                     # Coleta os links de paginação atuais
                                     links_pager = navegador.find_elements(
                                         By.CSS_SELECTOR,
@@ -373,11 +398,18 @@ def exportar_insumos(navegador):
                                     )
 
                                     if link_alvo:
-                                        # Encontrou o link — clica diretamente
+                                        # Captura botão atual antes de clicar para detectar staleness do postback
+                                        btn_antes = navegador.find_element(By.ID, "ctl00_MainContent_btnServicos")
                                         navegador.execute_script("arguments[0].scrollIntoView(true);", link_alvo)
                                         sleep(0.2)
                                         link_alvo.click()
                                         print(f"  Clicou no link '{proxima_pagina_num}', aguardando carregar...")
+
+                                        # Aguarda o postback completar (btn fica stale) antes de verificar página
+                                        try:
+                                            wait.until(EC.staleness_of(btn_antes))
+                                        except TimeoutException:
+                                            pass
                                         _aguardar_tabela()
 
                                         if _esta_na_pagina(proxima_pagina_num):
@@ -385,7 +417,7 @@ def exportar_insumos(navegador):
                                             navegou = True
                                         else:
                                             tentativa += 1
-                                            print(f"  ⚠ Página ainda não mudou (tentativa {tentativa}/{max_tentativas})")
+                                            print(f"  ⚠ Navegação incerta (tentativa {tentativa}/{max_tentativas}), verificando novamente...")
                                             sleep(0.5)
                                     else:
                                         # Link não visível — clica em "..." (que no ASP.NET já NAVEGA para o próximo grupo)
@@ -393,7 +425,13 @@ def exportar_insumos(navegador):
 
                                         if botoes_reticencias:
                                             print(f"  Página {proxima_pagina_num} não está visível, clicando em '...'")
+                                            btn_antes = navegador.find_element(By.ID, "ctl00_MainContent_btnServicos")
                                             botoes_reticencias[-1].click()
+
+                                            try:
+                                                wait.until(EC.staleness_of(btn_antes))
+                                            except TimeoutException:
+                                                pass
                                             _aguardar_tabela()
 
                                             pagina_obtida = _pagina_atual()
