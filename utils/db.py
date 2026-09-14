@@ -215,6 +215,59 @@ def criar_tabela_composicoes():
     _corrigir_tipo_coluna_datapreco('composicoes')
 
 
+def criar_tabela_memorial_descritivo():
+    """Cria a tabela de memoriais descritivos se ainda não existir."""
+    conn = _conectar()
+    cursor = conn.cursor()
+    cursor.execute("""
+        IF NOT EXISTS (
+            SELECT * FROM sys.objects
+            WHERE object_id = OBJECT_ID(N'[dbo].[memorial_descritivo]') AND type = N'U'
+        )
+        BEGIN
+            CREATE TABLE [dbo].[memorial_descritivo] (
+                CodMemorial  INT  NOT NULL IDENTITY(1,1) PRIMARY KEY,
+                ItemServico  VARCHAR(100) NULL,
+                Conteudo     TEXT NULL,
+                Criterio     TEXT NULL,
+                Normas       TEXT NULL
+            )
+        END
+    """)
+    conn.commit()
+    conn.close()
+    print("Tabela 'memorial_descritivo' verificada/criada com sucesso.")
+
+
+def memorial_ja_existe(item_servico: str) -> bool:
+    """Verifica se o memorial do serviço já foi salvo."""
+    conn = _conectar()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM memorial_descritivo WHERE ItemServico = ?",
+        item_servico
+    )
+    existe = cursor.fetchone() is not None
+    conn.close()
+    return existe
+
+
+def salvar_memorial_descritivo(item_servico: str, conteudo: str,
+                               criterio: str, normas: str):
+    """Salva o memorial descritivo associado a um serviço."""
+    conn = _conectar()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO memorial_descritivo (ItemServico, Conteudo, Criterio, Normas)
+        VALUES (?, ?, ?, ?)
+        """,
+        item_servico, conteudo, criterio, normas
+    )
+    conn.commit()
+    conn.close()
+
+
 def servico_ja_extraido(item: str) -> bool:
     """Verifica se o item já existe na tabela servicos."""
     conn = _conectar()

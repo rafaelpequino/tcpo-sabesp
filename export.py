@@ -178,9 +178,9 @@ def exportar_insumos(navegador):
 
                                 dados_item = [td.text for td in tds]
 
-                                # Verifica se o item já foi extraído hoje
-                                if db.item_ja_extraido_hoje(dados_item[1].strip()):
-                                    print(f"  ↷ Pulando {dados_item[1].strip()} (já extraído hoje)")
+                                # Verifica se o item já existe antes de abrir a página de insumo
+                                if db.insumo_existe(dados_item[1].strip()):
+                                    print(f"  ↷ Pulando {dados_item[1].strip()} (já existe no banco)")
                                     indice_tr += 1
                                     continue
 
@@ -727,6 +727,24 @@ def exportar_servicos(navegador):
     }
     total_salvos = 0
 
+    def extrair_memorial_descritivo():
+        """Extrai as três seções do memorial a partir do texto renderizado da página."""
+        texto_pagina = navegador.find_element(By.TAG_NAME, "body").text
+        padrao = re.compile(
+            r"CONTEÚDO DO SERVIÇO\s*(.*?)\s*"
+            r"CRITÉRIO DE MEDIÇÃO\s*(.*?)\s*"
+            r"NORMAS TÉCNICAS\s*(.*)",
+            re.IGNORECASE | re.DOTALL
+        )
+        match = padrao.search(texto_pagina)
+        if not match:
+            return None
+
+        return tuple(
+            re.sub(r"\s+", " ", secao).strip()
+            for secao in match.groups()
+        )
+
     # Achata o dict (categoria → lista de IDs) em pares (categoria, id_elemento)
     categorias_ids = [
         (cat, id_el)
@@ -736,7 +754,9 @@ def exportar_servicos(navegador):
 
     try:
         db.criar_tabela_servicos()
+        db.criar_tabela_insumos()
         db.criar_tabela_composicoes()
+        db.criar_tabela_memorial_descritivo()
         print("Iniciando leitura de serviços...")
 
         for categoria, id_elemento in categorias_ids:
@@ -935,6 +955,40 @@ def exportar_servicos(navegador):
 
                                 except TimeoutException:
                                     print(f"    [!] Sem composição para {item}")
+
+                                # Memorial descritivo é opcional no portal.
+                                botoes_memorial = navegador.find_elements(
+                                    By.ID,
+                                    "ctl00_MainContent_btnMemorialDescritivo"
+                                )
+                                if botoes_memorial:
+                                    try:
+                                        botoes_memorial[0].click()
+                                        wait_rapido.until(
+                                            lambda driver: all(
+                                                titulo in driver.find_element(By.TAG_NAME, "body").text.upper()
+                                                for titulo in (
+                                                    "CONTEÚDO DO SERVIÇO",
+                                                    "CRITÉRIO DE MEDIÇÃO",
+                                                    "NORMAS TÉCNICAS"
+                                                )
+                                            )
+                                        )
+                                        memorial = extrair_memorial_descritivo()
+                                        if memorial and not db.memorial_ja_existe(item):
+                                            db.salvar_memorial_descritivo(
+                                                item_servico=item,
+                                                conteudo=memorial[0],
+                                                criterio=memorial[1],
+                                                normas=memorial[2]
+                                            )
+                                            print(f"    [✓] Memorial descritivo adicionado: {item}")
+                                        elif not memorial:
+                                            print(f"    [!] Não foi possível identificar o conteúdo do memorial: {item}")
+                                    except TimeoutException:
+                                        print(f"    [!] Memorial descritivo não carregou: {item}")
+                                else:
+                                    print(f"    [-] Serviço sem memorial descritivo: {item}")
 
                                 # Retorna para a lista com retry
                                 retry_count = 0
@@ -1158,6 +1212,17 @@ def main():
         print("\n" + "=" * 70)
         print(" " * 15 + "SISTEMA DE EXPORTAÇÃO TCPO PINI")
         print("=" * 70 + "\n")
+
+        while True:
+            print("Escolha o tipo de exportação:")
+            print("1 - Serviços e composições")
+            print("2 - Insumos")
+            opcao_exportacao = input("Digite 1 ou 2: ").strip()
+
+            if opcao_exportacao in ("1", "2"):
+                break
+
+            print("Opção inválida. Escolha 1 para serviços ou 2 para insumos.\n")
         
         # Inicializa navegador
         try:
@@ -1193,16 +1258,15 @@ def main():
         print("[→] Preparando para exportação (aguardando 5 segundos)...")
         sleep(5)
         
-        # Exporta dados
-        #print("[→] Iniciando coleta de insumos\n")
-        #print("-" * 70 + "\n")
-        #exportar_insumos(navegador)
-        #print("\n" + "-" * 70)
-        #print("[✓] Insumos finalizados!\n")
-
-        print("[→] Iniciando coleta de serviços e composições\n")
+        if opcao_exportacao == "1":
+            print("[→] Iniciando coleta de serviços e composições\n")
+        else:
+            print("[→] Iniciando coleta de insumos\n")
         print("-" * 70 + "\n")
-        exportar_servicos(navegador)
+        if opcao_exportacao == "1":
+            exportar_servicos(navegador)
+        else:
+            exportar_insumos(navegador)
         print("\n" + "-" * 70)
         print("[✓] Processo finalizado com sucesso!\n")
         return True
