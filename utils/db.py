@@ -145,7 +145,8 @@ def criar_tabela_servicos():
                 Memorial_Conteudo  VARCHAR(MAX)   NULL,
                 Memorial_Criterio  VARCHAR(MAX)   NULL,
                 Memorial_Normas    VARCHAR(MAX)   NULL,
-                Memorial_Observacoes VARCHAR(MAX) NULL
+                Memorial_Observacoes VARCHAR(MAX) NULL,
+                Finalizado          BIT            NULL
             )
         END
         ELSE
@@ -180,6 +181,14 @@ def criar_tabela_servicos():
             )
             BEGIN
                 ALTER TABLE [dbo].[servicos] ADD Memorial_Observacoes VARCHAR(MAX) NULL;
+            END
+
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID(N'[dbo].[servicos]') AND name = 'Finalizado'
+            )
+            BEGIN
+                ALTER TABLE [dbo].[servicos] ADD Finalizado BIT NULL;
             END
         END
 
@@ -281,6 +290,16 @@ def servico_ja_extraido(item: str) -> bool:
     return existe
 
 
+def servico_finalizado(item: str) -> bool:
+    """Verifica se o serviço já concluiu todas as etapas da extração."""
+    conn = _conectar()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM servicos WHERE Item = ? AND Finalizado = 1", item)
+    finalizado = cursor.fetchone() is not None
+    conn.close()
+    return finalizado
+
+
 def insumo_existe(item: str) -> bool:
     """Verifica se o item já existe na tabela insumos (sem filtro de data)."""
     conn = _conectar()
@@ -294,7 +313,8 @@ def insumo_existe(item: str) -> bool:
 def salvar_servico(base: str, item: str, descricao: str, unidade: str,
                    tipo: str, data_preco: str, preco_str: str,
                    memorial_conteudo: str = None, memorial_criterio: str = None,
-                   memorial_normas: str = None, memorial_observacoes: str = None):
+                   memorial_normas: str = None, memorial_observacoes: str = None,
+                   finalizado: bool = False):
     """Salva um serviço extraído no banco de dados com suas informações de memorial descritivo."""
     brasilia = pytz.timezone("America/Sao_Paulo")
     dt_extracao = datetime.now(brasilia).replace(tzinfo=None)
@@ -309,11 +329,40 @@ def salvar_servico(base: str, item: str, descricao: str, unidade: str,
     cursor.execute(
         """
         INSERT INTO servicos (BaseExtraida, Item, Descricao, Unidade, Tipo, DataPreco, Preco, DtExtracao,
-                             Memorial_Conteudo, Memorial_Criterio, Memorial_Normas, Memorial_Observacoes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             Memorial_Conteudo, Memorial_Criterio, Memorial_Normas, Memorial_Observacoes, Finalizado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         base, item, descricao, unidade, tipo, data_preco, preco, dt_extracao,
-        memorial_conteudo, memorial_criterio, memorial_normas, memorial_observacoes
+        memorial_conteudo, memorial_criterio, memorial_normas, memorial_observacoes, finalizado
+    )
+    conn.commit()
+    conn.close()
+
+
+def atualizar_servico(base: str, item: str, descricao: str, unidade: str,
+                      tipo: str, data_preco: str, preco_str: str,
+                      memorial_conteudo: str = None, memorial_criterio: str = None,
+                      memorial_normas: str = None, memorial_observacoes: str = None,
+                      finalizado: bool = True):
+    """Atualiza os dados extraídos e o status de finalização do serviço."""
+    try:
+        preco = float(preco_str.replace(".", "").replace(",", "."))
+    except (ValueError, AttributeError):
+        preco = None
+
+    conn = _conectar()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE servicos
+        SET BaseExtraida = ?, Descricao = ?, Unidade = ?, Tipo = ?, DataPreco = ?, Preco = ?,
+            Memorial_Conteudo = ?, Memorial_Criterio = ?, Memorial_Normas = ?,
+            Memorial_Observacoes = ?, Finalizado = ?
+        WHERE Item = ?
+        """,
+        base, descricao, unidade, tipo, data_preco, preco,
+        memorial_conteudo, memorial_criterio, memorial_normas, memorial_observacoes,
+        finalizado, item
     )
     conn.commit()
     conn.close()

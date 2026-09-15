@@ -890,6 +890,12 @@ def exportar_servicos(navegador):
                                 descricao = tds[2].text.strip()
                                 unidade   = tds[3].text.strip()
 
+                                # Serviços concluídos não precisam abrir a página novamente.
+                                if db.servico_finalizado(item):
+                                    print(f"  ↷ Serviço já finalizado: {item}")
+                                    indice_tr += 1
+                                    continue
+
                                 # Clica no link do item com retry
                                 retry_count = 0
                                 while retry_count < max_retries:
@@ -915,6 +921,19 @@ def exportar_servicos(navegador):
 
                                 el_preco = navegador.find_element(By.CSS_SELECTOR, "#ctl00_MainContent_lblValorTotalSemTaxa")
                                 preco_str = el_preco.text.strip()
+
+                                # Registra o serviço como pendente antes das etapas que podem falhar.
+                                if not db.servico_ja_extraido(item):
+                                    db.salvar_servico(
+                                        base=base,
+                                        item=item,
+                                        descricao=descricao,
+                                        unidade=unidade,
+                                        tipo=tipo_servico,
+                                        data_preco=data_preco,
+                                        preco_str=preco_str,
+                                        finalizado=False
+                                    )
 
                                 # Lê tabela de composição (sempre, mesmo que o serviço já exista)
                                 try:
@@ -1025,25 +1044,23 @@ def exportar_servicos(navegador):
                                 else:
                                     print(f"    [-] Serviço sem memorial descritivo: {item}")
 
-                                # Salva o serviço apenas se ainda não existir
-                                if not db.servico_ja_extraido(item):
-                                    db.salvar_servico(
-                                        base=base,
-                                        item=item,
-                                        descricao=descricao,
-                                        unidade=unidade,
-                                        tipo=tipo_servico,
-                                        data_preco=data_preco,
-                                        preco_str=preco_str,
-                                        memorial_conteudo=memorial_conteudo,
-                                        memorial_criterio=memorial_criterio,
-                                        memorial_normas=memorial_normas,
-                                        memorial_observacoes=memorial_observacoes
-                                    )
-                                    total_salvos += 1
-                                    print(f"[{total_salvos}] {item}")
-                                else:
-                                    print(f"  ↷ Serviço já existe: {item} (verificando composições...)")
+                                # Atualiza o serviço existente e marca a extração como concluída.
+                                db.atualizar_servico(
+                                    base=base,
+                                    item=item,
+                                    descricao=descricao,
+                                    unidade=unidade,
+                                    tipo=tipo_servico,
+                                    data_preco=data_preco,
+                                    preco_str=preco_str,
+                                    memorial_conteudo=memorial_conteudo,
+                                    memorial_criterio=memorial_criterio,
+                                    memorial_normas=memorial_normas,
+                                    memorial_observacoes=memorial_observacoes,
+                                    finalizado=True
+                                )
+                                total_salvos += 1
+                                print(f"[{total_salvos}] {item} finalizado")
 
                                 # Retorna para a lista com retry
                                 retry_count = 0

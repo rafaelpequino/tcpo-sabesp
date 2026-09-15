@@ -44,7 +44,7 @@ As funções de persistência estão em `utils.db` e usam `DB_CONNECTION_STRING`
 
 Principais relações gravadas:
 
-- `servicos`: dados gerais, preço do serviço e memorial descritivo (`Memorial_Conteudo`, `Memorial_Criterio`, `Memorial_Normas`, `Memorial_Observacoes`);
+- `servicos`: dados gerais, preço do serviço, status de conclusão (`Finalizado`) e memorial descritivo (`Memorial_Conteudo`, `Memorial_Criterio`, `Memorial_Normas`, `Memorial_Observacoes`);
 - `insumos`: materiais/recursos associados e seus preços;
 - `composicoes`: vínculo entre serviço e insumo, coeficiente, preço unitário, preço total e consumo.
 
