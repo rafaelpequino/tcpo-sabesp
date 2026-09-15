@@ -26,7 +26,6 @@ def _conectar():
         conn_str = _re.sub(rf'{attr}\s*=\s*False', f'{attr}=no', conn_str, flags=_re.IGNORECASE)
     return pyodbc.connect(conn_str)
 
-
 def _corrigir_tipo_coluna_datapreco(tabela: str):
     """Corrige o tipo da coluna DataPreco para VARCHAR(20) se estiver com tipo errado."""
     conn = _conectar()
@@ -124,7 +123,7 @@ def salvar_insumo(base: str, item: str, descricao: str, unidade: str,
 
 
 def criar_tabela_servicos():
-    """Cria a tabela servicos no banco se ainda não existir."""
+    """Cria a tabela servicos no banco se ainda não existir e garante as colunas de memorial."""
     conn = _conectar()
     cursor = conn.cursor()
     cursor.execute("""
@@ -134,16 +133,73 @@ def criar_tabela_servicos():
         )
         BEGIN
             CREATE TABLE [dbo].[servicos] (
-                CodServico   INT            NOT NULL IDENTITY(1,1) PRIMARY KEY,
-                BaseExtraida VARCHAR(100)   NULL,
-                Item         VARCHAR(100)   NULL,
-                Descricao    VARCHAR(255)   NULL,
-                Unidade      VARCHAR(20)    NULL,
-                Tipo         VARCHAR(100)   NULL,
-                DataPreco    VARCHAR(20)    NULL,
-                Preco        DECIMAL(12,2)  NULL,
-                DtExtracao   DATETIME       NULL
+                CodServico         INT            NOT NULL IDENTITY(1,1) PRIMARY KEY,
+                BaseExtraida       VARCHAR(100)   NULL,
+                Item               VARCHAR(100)   NULL,
+                Descricao          VARCHAR(255)   NULL,
+                Unidade            VARCHAR(20)    NULL,
+                Tipo               VARCHAR(100)   NULL,
+                DataPreco          VARCHAR(20)    NULL,
+                Preco              DECIMAL(12,2)  NULL,
+                DtExtracao         DATETIME       NULL,
+                Memorial_Conteudo  VARCHAR(MAX)   NULL,
+                Memorial_Criterio  VARCHAR(MAX)   NULL,
+                Memorial_Normas    VARCHAR(MAX)   NULL,
+                Memorial_Observacoes VARCHAR(MAX) NULL
             )
+        END
+        ELSE
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID(N'[dbo].[servicos]') AND name = 'Memorial_Conteudo'
+            )
+            BEGIN
+                ALTER TABLE [dbo].[servicos] ADD Memorial_Conteudo VARCHAR(MAX) NULL;
+            END
+
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID(N'[dbo].[servicos]') AND name = 'Memorial_Criterio'
+            )
+            BEGIN
+                ALTER TABLE [dbo].[servicos] ADD Memorial_Criterio VARCHAR(MAX) NULL;
+            END
+
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID(N'[dbo].[servicos]') AND name = 'Memorial_Normas'
+            )
+            BEGIN
+                ALTER TABLE [dbo].[servicos] ADD Memorial_Normas VARCHAR(MAX) NULL;
+            END
+
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.columns 
+                WHERE object_id = OBJECT_ID(N'[dbo].[servicos]') AND name = 'Memorial_Observacoes'
+            )
+            BEGIN
+                ALTER TABLE [dbo].[servicos] ADD Memorial_Observacoes VARCHAR(MAX) NULL;
+            END
+        END
+
+        -- Migra dados existentes de memorial_descritivo se a tabela existir e depois a remove
+        IF EXISTS (
+            SELECT * FROM sys.objects
+            WHERE object_id = OBJECT_ID(N'[dbo].[memorial_descritivo]') AND type = N'U'
+        )
+        BEGIN
+            UPDATE s
+            SET s.Memorial_Conteudo = m.Conteudo,
+                s.Memorial_Criterio = m.Criterio,
+                s.Memorial_Normas   = m.Normas
+            FROM [dbo].[servicos] s
+            INNER JOIN [dbo].[memorial_descritivo] m ON s.Item = m.ItemServico
+            WHERE s.Memorial_Conteudo IS NULL 
+               OR s.Memorial_Criterio IS NULL 
+               OR s.Memorial_Normas IS NULL;
+
+            DROP TABLE [dbo].[memorial_descritivo];
         END
     """)
     conn.commit()
@@ -215,59 +271,6 @@ def criar_tabela_composicoes():
     _corrigir_tipo_coluna_datapreco('composicoes')
 
 
-def criar_tabela_memorial_descritivo():
-    """Cria a tabela de memoriais descritivos se ainda não existir."""
-    conn = _conectar()
-    cursor = conn.cursor()
-    cursor.execute("""
-        IF NOT EXISTS (
-            SELECT * FROM sys.objects
-            WHERE object_id = OBJECT_ID(N'[dbo].[memorial_descritivo]') AND type = N'U'
-        )
-        BEGIN
-            CREATE TABLE [dbo].[memorial_descritivo] (
-                CodMemorial  INT  NOT NULL IDENTITY(1,1) PRIMARY KEY,
-                ItemServico  VARCHAR(100) NULL,
-                Conteudo     TEXT NULL,
-                Criterio     TEXT NULL,
-                Normas       TEXT NULL
-            )
-        END
-    """)
-    conn.commit()
-    conn.close()
-    print("Tabela 'memorial_descritivo' verificada/criada com sucesso.")
-
-
-def memorial_ja_existe(item_servico: str) -> bool:
-    """Verifica se o memorial do serviço já foi salvo."""
-    conn = _conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT 1 FROM memorial_descritivo WHERE ItemServico = ?",
-        item_servico
-    )
-    existe = cursor.fetchone() is not None
-    conn.close()
-    return existe
-
-
-def salvar_memorial_descritivo(item_servico: str, conteudo: str,
-                               criterio: str, normas: str):
-    """Salva o memorial descritivo associado a um serviço."""
-    conn = _conectar()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO memorial_descritivo (ItemServico, Conteudo, Criterio, Normas)
-        VALUES (?, ?, ?, ?)
-        """,
-        item_servico, conteudo, criterio, normas
-    )
-    conn.commit()
-    conn.close()
-
-
 def servico_ja_extraido(item: str) -> bool:
     """Verifica se o item já existe na tabela servicos."""
     conn = _conectar()
@@ -289,8 +292,10 @@ def insumo_existe(item: str) -> bool:
 
 
 def salvar_servico(base: str, item: str, descricao: str, unidade: str,
-                   tipo: str, data_preco: str, preco_str: str):
-    """Salva um serviço extraído no banco de dados."""
+                   tipo: str, data_preco: str, preco_str: str,
+                   memorial_conteudo: str = None, memorial_criterio: str = None,
+                   memorial_normas: str = None, memorial_observacoes: str = None):
+    """Salva um serviço extraído no banco de dados com suas informações de memorial descritivo."""
     brasilia = pytz.timezone("America/Sao_Paulo")
     dt_extracao = datetime.now(brasilia).replace(tzinfo=None)
 
@@ -303,10 +308,12 @@ def salvar_servico(base: str, item: str, descricao: str, unidade: str,
     cursor = conn.cursor()
     cursor.execute(
         """
-        INSERT INTO servicos (BaseExtraida, Item, Descricao, Unidade, Tipo, DataPreco, Preco, DtExtracao)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO servicos (BaseExtraida, Item, Descricao, Unidade, Tipo, DataPreco, Preco, DtExtracao,
+                             Memorial_Conteudo, Memorial_Criterio, Memorial_Normas, Memorial_Observacoes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        base, item, descricao, unidade, tipo, data_preco, preco, dt_extracao
+        base, item, descricao, unidade, tipo, data_preco, preco, dt_extracao,
+        memorial_conteudo, memorial_criterio, memorial_normas, memorial_observacoes
     )
     conn.commit()
     conn.close()

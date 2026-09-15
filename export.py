@@ -25,6 +25,8 @@ options.add_argument("--disable-gpu")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--disable-extensions")
+options.add_argument("--log-level=3")
+options.add_argument("--silent")
 # Redução de consumo de memória
 options.add_argument("--aggressive-cache-discard")
 options.add_argument("--disk-cache-size=0")
@@ -35,12 +37,13 @@ options.add_argument("--disable-default-apps")
 options.add_argument("--disable-sync")
 options.add_argument("--disable-translate")
 options.add_argument("--no-first-run")
-options.add_experimental_option("excludeSwitches", ["enable-automation"])
+options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
 options.add_experimental_option('useAutomationExtension', False)
 # Desabilita carregamento de imagens (maior economia de memória e banda)
 options.add_experimental_option("prefs", {
     "profile.managed_default_content_settings.images": 2,
-    "profile.default_content_setting_values.notifications": 2
+    "profile.default_content_setting_values.notifications": 2,
+    "gcm.channel_status": False
 })
 
 url = "https://tcpoweb.pini.com.br/home/home.aspx"
@@ -728,22 +731,61 @@ def exportar_servicos(navegador):
     total_salvos = 0
 
     def extrair_memorial_descritivo():
-        """Extrai as três seções do memorial a partir do texto renderizado da página."""
-        texto_pagina = navegador.find_element(By.TAG_NAME, "body").text
-        padrao = re.compile(
-            r"CONTEÚDO DO SERVIÇO\s*(.*?)\s*"
-            r"CRITÉRIO DE MEDIÇÃO\s*(.*?)\s*"
-            r"NORMAS TÉCNICAS\s*(.*)",
-            re.IGNORECASE | re.DOTALL
-        )
-        match = padrao.search(texto_pagina)
-        if not match:
-            return None
+        """Extrai as seções de memorial descritivo a partir do texto ou container da página."""
+        try:
+            # Tenta encontrar primeiro no container principal de conteúdo se existir, senão pega do body
+            texto_base = ""
+            for seletor in ["#ctl00_MainContent_pnlMemorial", "#ctl00_MainContent_divMemorial", "#ctl00_MainContent_pnlDetalhes", "#ctl00_MainContent_gvMemorial", "body"]:
+                elementos = navegador.find_elements(By.CSS_SELECTOR, seletor)
+                if elementos and elementos[0].text.strip():
+                    texto_base = elementos[0].text
+                    if "CONTEÚDO DO SERVIÇO" in texto_base.upper() or "CRITÉRIO DE MEDIÇÃO" in texto_base.upper():
+                        break
 
-        return tuple(
-            re.sub(r"\s+", " ", secao).strip()
-            for secao in match.groups()
-        )
+            if not texto_base:
+                texto_base = navegador.find_element(By.TAG_NAME, "body").text
+
+            def _limpar_texto(t):
+                if not t:
+                    return None
+                t = re.sub(r"\s+", " ", t).strip()
+                return t if t else None
+
+            # Regex flexível para capturar as três partes (mesmo que alguma esteja ausente)
+            # Padrões com limites definidos pelos títulos ou fim do texto/seção de botões/footer
+            padrao_conteudo = re.search(
+                r"CONTEÚDO DO SERVIÇO\s*(.*?)(?=(?:CRITÉRIO DE MEDIÇÃO|NORMAS TÉCNICAS|OBSERVA(?:ÇÕES|COES)|ctl00|\Z))",
+                texto_base,
+                re.IGNORECASE | re.DOTALL
+            )
+            padrao_criterio = re.search(
+                r"CRITÉRIO DE MEDIÇÃO\s*(.*?)(?=(?:NORMAS TÉCNICAS|OBSERVA(?:ÇÕES|COES)|CONTEÚDO DO SERVIÇO|ctl00|\Z))",
+                texto_base,
+                re.IGNORECASE | re.DOTALL
+            )
+            padrao_normas = re.search(
+                r"NORMAS TÉCNICAS\s*(.*?)(?=(?:OBSERVA(?:ÇÕES|COES)|CONTEÚDO DO SERVIÇO|CRITÉRIO DE MEDIÇÃO|ctl00|\Z))",
+                texto_base,
+                re.IGNORECASE | re.DOTALL
+            )
+            padrao_observacoes = re.search(
+                r"OBSERVA(?:ÇÕES|COES)\s*(.*?)(?=(?:CONTEÚDO DO SERVIÇO|CRITÉRIO DE MEDIÇÃO|NORMAS TÉCNICAS|ctl00|\Z))",
+                texto_base,
+                re.IGNORECASE | re.DOTALL
+            )
+
+            conteudo = _limpar_texto(padrao_conteudo.group(1)) if padrao_conteudo else None
+            criterio = _limpar_texto(padrao_criterio.group(1)) if padrao_criterio else None
+            normas = _limpar_texto(padrao_normas.group(1)) if padrao_normas else None
+            observacoes = _limpar_texto(padrao_observacoes.group(1)) if padrao_observacoes else None
+
+            # Se nenhuma das seções foi encontrada, retorna None
+            if not conteudo and not criterio and not normas and not observacoes:
+                return None
+
+            return (conteudo, criterio, normas, observacoes)
+        except Exception:
+            return None
 
     # Achata o dict (categoria → lista de IDs) em pares (categoria, id_elemento)
     categorias_ids = [
@@ -756,7 +798,6 @@ def exportar_servicos(navegador):
         db.criar_tabela_servicos()
         db.criar_tabela_insumos()
         db.criar_tabela_composicoes()
-        db.criar_tabela_memorial_descritivo()
         print("Iniciando leitura de serviços...")
 
         for categoria, id_elemento in categorias_ids:
@@ -875,22 +916,6 @@ def exportar_servicos(navegador):
                                 el_preco = navegador.find_element(By.CSS_SELECTOR, "#ctl00_MainContent_lblValorTotalSemTaxa")
                                 preco_str = el_preco.text.strip()
 
-                                # Salva o serviço apenas se ainda não existir
-                                if not db.servico_ja_extraido(item):
-                                    db.salvar_servico(
-                                        base=base,
-                                        item=item,
-                                        descricao=descricao,
-                                        unidade=unidade,
-                                        tipo=tipo_servico,
-                                        data_preco=data_preco,
-                                        preco_str=preco_str
-                                    )
-                                    total_salvos += 1
-                                    print(f"[{total_salvos}] {item}")
-                                else:
-                                    print(f"  ↷ Serviço já existe: {item} (verificando composições...)")
-
                                 # Lê tabela de composição (sempre, mesmo que o serviço já exista)
                                 try:
                                     wait_rapido.until(EC.presence_of_element_located(
@@ -956,39 +981,69 @@ def exportar_servicos(navegador):
                                 except TimeoutException:
                                     print(f"    [!] Sem composição para {item}")
 
-                                # Memorial descritivo é opcional no portal.
+                                # Coleta memorial descritivo (opcional no portal)
+                                memorial_conteudo = None
+                                memorial_criterio = None
+                                memorial_normas = None
+                                memorial_observacoes = None
+
                                 botoes_memorial = navegador.find_elements(
                                     By.ID,
                                     "ctl00_MainContent_btnMemorialDescritivo"
                                 )
                                 if botoes_memorial:
                                     try:
-                                        botoes_memorial[0].click()
+                                        # Rola até o botão e clica via JavaScript para evitar clique bloqueado
+                                        navegador.execute_script("arguments[0].scrollIntoView(true);", botoes_memorial[0])
+                                        sleep(0.3)
+                                        try:
+                                            botoes_memorial[0].click()
+                                        except Exception:
+                                            navegador.execute_script("arguments[0].click();", botoes_memorial[0])
+
+                                        # Aguarda a presença de conteúdo ou qualquer uma das seções do memorial
                                         wait_rapido.until(
-                                            lambda driver: all(
-                                                titulo in driver.find_element(By.TAG_NAME, "body").text.upper()
-                                                for titulo in (
-                                                    "CONTEÚDO DO SERVIÇO",
-                                                    "CRITÉRIO DE MEDIÇÃO",
-                                                    "NORMAS TÉCNICAS"
-                                                )
+                                            lambda driver: (
+                                                "CONTEÚDO DO SERVIÇO" in driver.find_element(By.TAG_NAME, "body").text.upper()
+                                                or "CRITÉRIO DE MEDIÇÃO" in driver.find_element(By.TAG_NAME, "body").text.upper()
+                                                or "NORMAS TÉCNICAS" in driver.find_element(By.TAG_NAME, "body").text.upper()
+                                                or "OBSERVAÇÕES" in driver.find_element(By.TAG_NAME, "body").text.upper()
+                                                or "OBSERVACOES" in driver.find_element(By.TAG_NAME, "body").text.upper()
                                             )
                                         )
+                                        sleep(0.3)
                                         memorial = extrair_memorial_descritivo()
-                                        if memorial and not db.memorial_ja_existe(item):
-                                            db.salvar_memorial_descritivo(
-                                                item_servico=item,
-                                                conteudo=memorial[0],
-                                                criterio=memorial[1],
-                                                normas=memorial[2]
-                                            )
-                                            print(f"    [✓] Memorial descritivo adicionado: {item}")
-                                        elif not memorial:
-                                            print(f"    [!] Não foi possível identificar o conteúdo do memorial: {item}")
+                                        if memorial:
+                                            memorial_conteudo, memorial_criterio, memorial_normas, memorial_observacoes = memorial
+                                            print(f"    [✓] Memorial descritivo coletado: {item}")
+                                        else:
+                                            print(f"    [!] Não foi possível identificar as seções do memorial: {item}")
                                     except TimeoutException:
                                         print(f"    [!] Memorial descritivo não carregou: {item}")
+                                    except Exception as e:
+                                        print(f"    [!] Erro ao obter memorial descritivo ({item}): {e}")
                                 else:
                                     print(f"    [-] Serviço sem memorial descritivo: {item}")
+
+                                # Salva o serviço apenas se ainda não existir
+                                if not db.servico_ja_extraido(item):
+                                    db.salvar_servico(
+                                        base=base,
+                                        item=item,
+                                        descricao=descricao,
+                                        unidade=unidade,
+                                        tipo=tipo_servico,
+                                        data_preco=data_preco,
+                                        preco_str=preco_str,
+                                        memorial_conteudo=memorial_conteudo,
+                                        memorial_criterio=memorial_criterio,
+                                        memorial_normas=memorial_normas,
+                                        memorial_observacoes=memorial_observacoes
+                                    )
+                                    total_salvos += 1
+                                    print(f"[{total_salvos}] {item}")
+                                else:
+                                    print(f"  ↷ Serviço já existe: {item} (verificando composições...)")
 
                                 # Retorna para a lista com retry
                                 retry_count = 0
